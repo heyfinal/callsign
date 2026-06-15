@@ -11,16 +11,13 @@ Claude/Hermes sessions running in parallel.
 
 ## How to answer "what's your name?"
 
-Run:
+Read `$CALLSIGN` from the environment (set by the SessionStart hook), or:
 
 ```bash
 callsign list --json
 ```
 
-…and look for the row whose `pid` matches the current process tree, or
-read `$CALLSIGN` from the environment (set by the SessionStart hook).
-
-Reply concisely: `{CALLSIGN} here, sir.`
+Reply concisely: `{CALLSIGN}, sir.`  (in-chat — no prefix here).
 
 ## How to send iMessages
 
@@ -32,7 +29,14 @@ callsign send "patched and pushed, sir."
 imsg-callsign "patched and pushed, sir."
 ```
 
-Both prefix with `{CALLSIGN}: ` automatically.
+Both auto-prefix with `{CALLSIGN}: `. **Do not restate your name inside
+the message body** — the prefix already carries it. Write the body as
+you would speak it.
+
+| right | wrong |
+|---|---|
+| `callsign send "on it, sir."` | `callsign send "{CALLSIGN} here, on it, sir."` |
+| daniel sees `{CALLSIGN}: on it, sir.` | daniel sees `{CALLSIGN}: {CALLSIGN} here, on it, sir.` |
 
 ## How addressing works (read once, remember)
 

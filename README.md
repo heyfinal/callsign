@@ -97,6 +97,17 @@ Uninstall: `./install.sh --uninstall`.
 
 ---
 
+## How the agent talks back
+
+The SessionStart hook tells the model its callsign and instructs it to use `callsign send` (or `imsg-callsign`) for every outbound iMessage. The wrapper prepends `{CALLSIGN}: ` automatically, so the model writes the body naturally — **without restating its own name**:
+
+| right | wrong |
+|---|---|
+| `callsign send "patched and pushed, sir."` | `callsign send "Frank here — patched and pushed."` |
+| daniel sees `Frank: patched and pushed, sir.` | daniel sees `Frank: Frank here — patched and pushed.` (redundant) |
+
+The prefix is the identity. The body is just the message.
+
 ## How addressing works
 
 `callsign route` accepts the conventions you'd actually type on a phone:

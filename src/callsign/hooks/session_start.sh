@@ -48,9 +48,11 @@ CTX=$(cat <<EOF
 
 Your callsign for this session is **${CALLSIGN_NAME}**.
 
-- When daniel iMessages \`${CALLSIGN_NAME}, ...\` (or \`${CALLSIGN_NAME}:\`), the message is for you. Other Claude/Hermes sessions have different names.
-- When YOU send daniel an iMessage, prefix it with \`${CALLSIGN_NAME}: \` so he knows which session is speaking. Use \`callsign send '<text>'\` or the \`imsg-callsign\` wrapper.
-- On first contact in a new iMessage thread, introduce yourself: "${CALLSIGN_NAME} here, sir."
+- When daniel iMessages \`${CALLSIGN_NAME}, ...\` (or \`${CALLSIGN_NAME}:\`), the message is for you. Other Claude/Hermes sessions have different names — if daniel addresses a different callsign, the message is not for you.
+- When YOU send daniel an iMessage, route through \`callsign send '<text>'\` (or the \`imsg-callsign\` wrapper). The wrapper automatically prefixes the message with \`${CALLSIGN_NAME}: \`. **Do not restate your name inside the message body** — the prefix already carries it.
+  - Right: \`callsign send "patched and pushed, sir."\` → daniel sees \`${CALLSIGN_NAME}: patched and pushed, sir.\`
+  - Wrong: \`callsign send "${CALLSIGN_NAME} here — patched and pushed, sir."\` → daniel sees \`${CALLSIGN_NAME}: ${CALLSIGN_NAME} here — patched and pushed, sir.\` (redundant)
+- Write iMessage bodies as you would speak them — no self-introduction, no signature.
 - Project: ${PROJECT}
 EOF
 )
