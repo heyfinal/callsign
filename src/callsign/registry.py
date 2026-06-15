@@ -20,6 +20,14 @@ from callsign import names
 from callsign.paths import DB_PATH, ensure_dirs
 
 
+class NameTakenError(Exception):
+    """Raised when an agent tries to claim a name that's already active."""
+
+
+class InvalidNameError(Exception):
+    """Raised when the requested name fails validation."""
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     callsign     TEXT PRIMARY KEY COLLATE NOCASE,
@@ -111,6 +119,90 @@ def reap_dead(conn: sqlite3.Connection | None = None) -> int:
             conn.close()
 
 
+def claim(
+    name: str,
+    platform: str,
+    project_path: str | Path | None = None,
+    pid: int | None = None,
+    session_uid: str | None = None,
+    env: dict | None = None,
+) -> Session:
+    """Claim a SPECIFIC name for the calling session.
+
+    This is the primary, agent-driven path: the model picks its own name
+    and asks the registry to reserve it. The name must pass
+    ``names.is_valid_name`` and not already be active.
+
+    If ``session_uid`` already has an active row whose callsign matches
+    ``name``, the call is idempotent. If the active row has a DIFFERENT
+    name, the existing row is retired first (agent is renaming itself).
+    """
+    ok, reason = names.is_valid_name(name)
+    if not ok:
+        raise InvalidNameError(reason)
+
+    conn = _connect()
+    try:
+        reap_dead(conn)
+        now = time.time()
+        env_json = json.dumps(env or {})
+        proj = str(Path(project_path).resolve()) if project_path else None
+
+        if session_uid:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE session_uid=? AND status='active'",
+                (session_uid,),
+            ).fetchone()
+            if row:
+                if row["callsign"].lower() == name.lower():
+                    conn.execute(
+                        "UPDATE sessions SET last_seen=?, pid=COALESCE(?,pid) "
+                        "WHERE callsign=?",
+                        (now, pid, row["callsign"]),
+                    )
+                    return Session.from_row(
+                        conn.execute(
+                            "SELECT * FROM sessions WHERE callsign=?",
+                            (row["callsign"],),
+                        ).fetchone()
+                    )
+                conn.execute(
+                    "UPDATE sessions SET status='retired', last_seen=? WHERE callsign=?",
+                    (now, row["callsign"]),
+                )
+
+        try:
+            conn.execute(
+                "INSERT INTO sessions "
+                "(callsign, platform, project_path, pid, session_uid, started_at, "
+                " last_seen, status, env_json) VALUES (?,?,?,?,?,?,?, 'active', ?)",
+                (name, platform, proj, pid, session_uid, now, now, env_json),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT callsign, status FROM sessions WHERE callsign=? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+            if existing and existing["status"] == "active":
+                raise NameTakenError(
+                    f"'{name}' is already in use by another active session — pick a different name"
+                )
+            conn.execute(
+                "UPDATE sessions SET status='active', platform=?, project_path=?, "
+                "pid=?, session_uid=?, started_at=?, last_seen=?, env_json=? "
+                "WHERE callsign=? COLLATE NOCASE",
+                (platform, proj, pid, session_uid, now, now, env_json, name),
+            )
+
+        return Session.from_row(
+            conn.execute(
+                "SELECT * FROM sessions WHERE callsign=? COLLATE NOCASE", (name,)
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+
+
 def assign(
     platform: str,
     project_path: str | Path | None = None,
@@ -120,14 +212,11 @@ def assign(
     env: dict | None = None,
     reuse_project: bool = True,
 ) -> Session:
-    """Claim a callsign.
+    """Legacy auto-assign path. Agents should call ``claim`` instead.
 
-    If ``session_uid`` is given and already has an active row, that row is
-    refreshed and returned (idempotent for the same session).
-
-    If ``reuse_project`` is True (default) and ``project_path`` has an active
-    callsign whose pid is alive, that name is returned — gives a stable
-    "Frank is the wellrx guy" mental model across reopens.
+    Kept for non-interactive callers (Hermes batch jobs, cron workers) that
+    can't pick a name for themselves. If ``preferred`` is given it's tried
+    first; otherwise a name from ``names.SUGGESTION_POOL`` is auto-picked.
     """
     conn = _connect()
     try:
@@ -205,6 +294,32 @@ def assign(
                 "SELECT * FROM sessions WHERE callsign=?", (chosen,)
             ).fetchone()
         )
+    finally:
+        conn.close()
+
+
+def lookup_by_session_uid(uid: str) -> Session | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE session_uid=? AND status='active' "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (uid,),
+        ).fetchone()
+        return Session.from_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def lookup_by_project(path: str | Path) -> Session | None:
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE project_path=? AND status='active' "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (str(Path(path).resolve()),),
+        ).fetchone()
+        return Session.from_row(row) if row else None
     finally:
         conn.close()
 

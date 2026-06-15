@@ -12,6 +12,24 @@ def _pretty_platform(platform: str) -> str:
     return _PLATFORM_LABEL.get(platform.lower(), platform)
 
 
+def awaiting_claim(platform: str = "Claude Code") -> str:
+    label = _pretty_platform(platform)
+    line1 = "  CALLSIGN ▸ (awaiting your choice)"
+    line2 = f"  ⸺ {label} session: pick a name for yourself."
+    line3 = "  run:  callsign claim <YourName>"
+    line4 = "  see suggestions:  callsign suggest"
+    inner = max(len(line1), len(line2), len(line3), len(line4)) + 2
+    bar = "━" * (inner + 2)
+    return (
+        f"\n{bar}\n"
+        f"┃{line1.ljust(inner)}┃\n"
+        f"┃{line2.ljust(inner)}┃\n"
+        f"┃{line3.ljust(inner)}┃\n"
+        f"┃{line4.ljust(inner)}┃\n"
+        f"{bar}\n"
+    )
+
+
 def intro(callsign: str, platform: str = "Claude Code") -> str:
     name = callsign.upper()
     label = _pretty_platform(platform)
@@ -26,6 +44,45 @@ def intro(callsign: str, platform: str = "Claude Code") -> str:
         f"┃{line2.ljust(inner)}┃\n"
         f"┃{line3.ljust(inner)}┃\n"
         f"{bar}\n"
+    )
+
+
+def awaiting_claim_context(platform: str = "Claude Code", suggestions: list[str] | None = None) -> str:
+    """The additionalContext block injected when no callsign has been claimed yet.
+
+    Tells the agent: pick your OWN name and run ``callsign claim``.
+    """
+    sug = ""
+    if suggestions:
+        sug = (
+            "\n\nIf you want examples (not a constraint), here are a few unused "
+            f"options: {', '.join(suggestions)}. You may pick any name you like — "
+            "single token, 2–20 chars, letters only."
+        )
+    return (
+        "## Callsign — pick your own name\n\n"
+        "**This session does not yet have a callsign.** Before doing anything else,\n"
+        "choose a single human name for yourself (any name — Frank, Vesper, Maverick,\n"
+        "anything that feels right) and claim it by running:\n\n"
+        "```bash\n"
+        "callsign claim <YourName>\n"
+        "```\n\n"
+        "Why: daniel runs several Claude/Hermes sessions in parallel and addresses\n"
+        "them by name. Your callsign is how he routes messages to *you* specifically.\n\n"
+        "Rules:\n\n"
+        "- Pick a name you haven't claimed yet — run `callsign list` to see who's\n"
+        "  already in use across other sessions.\n"
+        "- If `claim` returns `name_taken`, pick a different name and try again.\n"
+        "- Don't pick `Brodie` (legacy reserved trigger).\n"
+        "- Once claimed, **introduce yourself in chat** with the name you picked\n"
+        "  (e.g. `I'll be Frank for this session, sir.`).\n"
+        "- For every outbound iMessage, use `callsign send '<text>'` (or\n"
+        "  `imsg-callsign '<text>'`). The wrapper auto-prefixes with your name —\n"
+        "  **do not restate your name inside the message body**. The prefix carries it.\n"
+        "  - Right: `callsign send \"patched and pushed, sir.\"`\n"
+        "  - Wrong: `callsign send \"Frank here, patched and pushed.\"`\n"
+        f"- Platform: {_pretty_platform(platform)}"
+        f"{sug}\n"
     )
 
 

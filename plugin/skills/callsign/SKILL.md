@@ -1,27 +1,31 @@
 ---
 name: callsign
-description: Show this session's callsign and tell daniel how addressing works. Invoke when daniel asks "what is your name?" / "who am I talking to?" / "which session is this?" or when introducing yourself in a new iMessage thread.
+description: Pick your own callsign for this session, claim it, and use it on every outbound iMessage. Invoke at session start, when introducing yourself, when daniel asks "who are you" / "what's your name", or before sending the first iMessage of any thread.
 ---
 
 # callsign skill
 
-Your session has a unique callsign — a single human name (e.g. `Frank`,
-`Steven`) that daniel uses to address you specifically when he has multiple
-Claude/Hermes sessions running in parallel.
+You run alongside other Claude/Hermes sessions. Daniel addresses each one by a unique name. **You pick yours.**
 
-## How to answer "what's your name?"
+## Step 1 — pick your name (do this on first turn)
 
-Read `$CALLSIGN` from the environment (set by the SessionStart hook), or:
+If `$CALLSIGN` is empty and `callsign list --json` doesn't show your session UID, you have not yet claimed a name. Pick one — any single human name that fits (Frank, Vesper, Maverick, anything you like) — and run:
 
 ```bash
-callsign list --json
+callsign claim <YourName>
 ```
 
-Reply concisely: `{CALLSIGN}, sir.`  (in-chat — no prefix here).
+Rules:
 
-## How to send iMessages
+- Single token, 2–20 chars, letters only (plus optional `-` or `'`).
+- Must not already be active. Run `callsign list` first.
+- Don't pick `Brodie` (legacy reserved trigger).
+- If you have no preference, `callsign suggest` returns a few unused options — those are examples, not a constraint.
+- If `claim` returns `name_taken`, pick a different name and retry.
 
-Use the wrapper so daniel sees who's speaking:
+After a successful claim, introduce yourself in chat with the name you picked, e.g. `I'll be Frank for this session, sir.`
+
+## Step 2 — send iMessages with the wrapper
 
 ```bash
 callsign send "patched and pushed, sir."
@@ -29,21 +33,16 @@ callsign send "patched and pushed, sir."
 imsg-callsign "patched and pushed, sir."
 ```
 
-Both auto-prefix with `{CALLSIGN}: `. **Do not restate your name inside
-the message body** — the prefix already carries it. Write the body as
-you would speak it.
+Both auto-prefix with `{YourName}: `. **Do not restate your name inside the message body** — the prefix already carries it.
 
 | right | wrong |
 |---|---|
-| `callsign send "on it, sir."` | `callsign send "{CALLSIGN} here, on it, sir."` |
-| daniel sees `{CALLSIGN}: on it, sir.` | daniel sees `{CALLSIGN}: {CALLSIGN} here, on it, sir.` |
+| `callsign send "on it, sir."` | `callsign send "Frank here, on it, sir."` |
+| daniel sees `Frank: on it, sir.` | daniel sees `Frank: Frank here, on it, sir.` |
 
-## How addressing works (read once, remember)
+## Step 3 — answer addressing correctly
 
-- `Frank, do X`  → routes to the session whose callsign is Frank.
-- `Steven, ...`  → routes to Steven's session.
-- `Brodie, ...`  → legacy default; falls to the lead session.
-- A reply with no leading name falls to the active default session.
-
-If daniel addresses a different callsign, do not respond — that message is
-for another session.
+- `Frank, do X`  → if Frank is your callsign, the message is for you.
+- `Steven, ...`  → different callsign → not for you; do not respond.
+- `Brodie, ...`  → legacy default; only respond if you are the lead session.
+- No leading name → respond as the default session if you are it.

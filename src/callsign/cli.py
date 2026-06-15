@@ -32,6 +32,96 @@ def _detect_session_uid() -> str | None:
     return None
 
 
+def _resolve_callsign(explicit: str | None = None) -> str | None:
+    """Find the current session's callsign without requiring $CALLSIGN.
+
+    Order: explicit arg → $CALLSIGN → registry lookup by session UID
+    → registry lookup by project path.
+    """
+    if explicit:
+        return explicit
+    env = os.environ.get("CALLSIGN")
+    if env:
+        return env
+    uid = _detect_session_uid()
+    if uid:
+        sess = registry.lookup_by_session_uid(uid)
+        if sess:
+            return sess.callsign
+    proj = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if proj:
+        sess = registry.lookup_by_project(proj)
+        if sess:
+            return sess.callsign
+    return None
+
+
+def cmd_claim(ns: argparse.Namespace) -> int:
+    ensure_dirs()
+    try:
+        sess = registry.claim(
+            name=ns.name,
+            platform=ns.platform,
+            project_path=ns.project or os.getcwd(),
+            pid=ns.pid or os.getppid(),
+            session_uid=ns.session_uid or _detect_session_uid(),
+            env={"argv0": sys.argv[0]},
+        )
+    except registry.InvalidNameError as e:
+        msg = f"invalid name: {e}"
+        if ns.json:
+            print(json.dumps({"ok": False, "error": "invalid_name", "message": str(e)}))
+        else:
+            print(msg, file=sys.stderr)
+        return 2
+    except registry.NameTakenError as e:
+        if ns.json:
+            print(json.dumps({"ok": False, "error": "name_taken", "message": str(e)}))
+        else:
+            print(str(e), file=sys.stderr)
+            taken = {s.callsign for s in registry.list_active()}
+            free = names.suggest(taken, n=5)
+            if free:
+                print(f"  some unused suggestions: {', '.join(free)}", file=sys.stderr)
+        return 3
+
+    uid = sess.session_uid or f"pid-{sess.pid}"
+    env_path = _session_env_path(uid)
+    env_path.write_text(
+        f"CALLSIGN={sess.callsign}\nCALLSIGN_PLATFORM={sess.platform}\n"
+        f"CALLSIGN_PROJECT={sess.project_path or ''}\nCALLSIGN_PID={sess.pid or ''}\n"
+    )
+    if ns.json:
+        print(json.dumps({
+            "ok": True,
+            "callsign": sess.callsign,
+            "platform": sess.platform,
+            "project_path": sess.project_path,
+            "pid": sess.pid,
+            "session_uid": sess.session_uid,
+        }))
+    elif ns.quiet:
+        print(sess.callsign)
+    else:
+        print(banner.intro(sess.callsign, platform=sess.platform), file=sys.stderr)
+        print(sess.callsign)
+    return 0
+
+
+def cmd_suggest(ns: argparse.Namespace) -> int:
+    taken = {s.callsign for s in registry.list_active()}
+    free = names.suggest(taken, n=ns.count)
+    if ns.json:
+        print(json.dumps({"suggestions": free, "note": "these are examples; pick any name"}))
+    else:
+        if free:
+            for n in free:
+                print(n)
+        else:
+            print("(no suggestions available)")
+    return 0
+
+
 def cmd_assign(ns: argparse.Namespace) -> int:
     ensure_dirs()
     sess = registry.assign(
@@ -142,16 +232,23 @@ def cmd_route(ns: argparse.Namespace) -> int:
 
 
 def cmd_banner(ns: argparse.Namespace) -> int:
-    cs = ns.name or os.environ.get("CALLSIGN")
+    cs = _resolve_callsign(ns.name)
     if not cs:
-        print("set CALLSIGN env or pass --name", file=sys.stderr)
-        return 2
+        sys.stdout.write(banner.awaiting_claim(platform=ns.platform))
+        return 0
     sys.stdout.write(banner.intro(cs, platform=ns.platform))
     return 0
 
 
 def cmd_send(ns: argparse.Namespace) -> int:
-    cs = ns.callsign or os.environ.get("CALLSIGN") or ""
+    cs = _resolve_callsign(ns.callsign) or ""
+    if not cs and not ns.no_prefix:
+        print(
+            "no callsign claimed for this session — run `callsign claim <YourName>` first, "
+            "or use --no-prefix to send raw",
+            file=sys.stderr,
+        )
+        return 4
     text = ns.text
     if cs and not ns.no_prefix:
         text = f"{cs}: {text}"
@@ -230,7 +327,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"callsign {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    a = sub.add_parser("assign", help="claim a callsign for this session")
+    a = sub.add_parser("claim", help="claim a SPECIFIC name for this session (agent-driven)")
+    a.add_argument("name", help="the name you (the agent) are picking for yourself")
+    a.add_argument("--platform", default="claude-code")
+    a.add_argument("--project", default=None)
+    a.add_argument("--pid", type=int, default=None)
+    a.add_argument("--session-uid", default=None)
+    a.add_argument("--json", action="store_true")
+    a.add_argument("--quiet", action="store_true",
+                   help="only print the callsign on stdout")
+    a.set_defaults(func=cmd_claim)
+
+    a = sub.add_parser("suggest",
+                       help="list a few unused example names (agents may pick any name)")
+    a.add_argument("-n", "--count", type=int, default=5)
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_suggest)
+
+    a = sub.add_parser("assign",
+                       help="auto-pick a name (legacy / non-interactive callers)")
     a.add_argument("--platform", default="claude-code")
     a.add_argument("--project", default=None)
     a.add_argument("--pid", type=int, default=None)

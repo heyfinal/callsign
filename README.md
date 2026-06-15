@@ -21,7 +21,7 @@ But which `Brodie` did you mean? You can't pin a reply to a specific session.
 
 ## The fix
 
-At session start, `callsign` assigns this session a unique name from a curated pool — `Frank`, `Steven`, `Marcus`, etc. — registers it in a shared SQLite registry, and tells the model what its name is. The model introduces itself on launch and prefixes every outbound iMessage with its name.
+At session start, `callsign` tells the model: **pick your own name**. The model chooses (any single human name — `Frank`, `Vesper`, `Maverick`, anything that fits the agent's vibe), claims it through the registry (`callsign claim <name>`), introduces itself in chat, and from then on every outbound iMessage is auto-prefixed with that name.
 
 You address whichever session you want:
 
@@ -37,20 +37,36 @@ A leading-name router resolves each message to the right session.
 ## Demo
 
 ```
-$ callsign assign --platform claude-code --project ~/GIT/wellrx
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-┃  CALLSIGN ▸ FRANK                          ┃
-┃  ⸺ Claude Code session reporting in, sir.  ┃
-┃  reply with 'Frank, ...' to route iMessages┃
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Frank
+# session boot — the model is told to pick its own name
+$ callsign banner
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┃  CALLSIGN ▸ (awaiting your choice)                 ┃
+┃  ⸺ Claude Code session: pick a name for yourself.  ┃
+┃  run:  callsign claim <YourName>                   ┃
+┃  see suggestions:  callsign suggest                ┃
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+# the agent decides on a name (it can pick ANY single human name) and claims it
+$ callsign claim Vesper
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+┃  CALLSIGN ▸ VESPER                                  ┃
+┃  ⸺ Claude Code session reporting in, sir.           ┃
+┃  reply with 'Vesper, ...' to route iMessages here.  ┃
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# from now on every outbound iMessage is signed
 $ callsign send "patched and pushed, sir."
-# delivers: "Frank: patched and pushed, sir."
+# delivers: "Vesper: patched and pushed, sir."
 
-$ callsign route "Steven, redeploy the worker"
-Steven → /Users/daniel/AI/wellrx_REDESIGN
+# inbound routing — daniel addresses a specific session by name
+$ callsign route "Frank, redeploy the worker"
+Frank → /Users/daniel/AI/wellrx_REDESIGN
 redeploy the worker
+
+# collisions are rejected cleanly
+$ callsign claim Vesper          # from a different session
+'Vesper' is already in use by another active session — pick a different name
+  some unused suggestions: Maeve, Atlas, Sloane, Knox, Aurora
 ```
 
 ---
@@ -159,9 +175,16 @@ Design choices:
 ```python
 from callsign.hermes import HermesCallsign
 
-cs = HermesCallsign.boot(agent_id="lead", project_path="/srv/wellrx")
+# 1. inject the "pick your own name" context into the agent's system prompt
+system_prompt += "\n\n" + HermesCallsign.awaiting_context()
+
+# 2. the agent picks a name and claims it
+cs = HermesCallsign.claim("Vesper", agent_id="lead", project_path="/srv/wellrx")
 print(cs.banner())                # log on stdout
-cs.send_imessage("on it, sir.")   # → "Frank: on it, sir."
+cs.send_imessage("on it, sir.")   # → "Vesper: on it, sir."
+
+# unattended cron/batch jobs that can't pick can fall back to auto-assign
+cs = HermesCallsign.boot_auto(agent_id="nightly", project_path="/srv/wellrx")
 ```
 
 Same registry, same name pool, same routing semantics.
@@ -171,8 +194,14 @@ Same registry, same name pool, same routing semantics.
 ## CLI reference
 
 ```
+callsign claim    NAME [--platform P] [--project DIR] [--session-uid UID]
+                  [--json|--quiet]
+                  # PRIMARY path — agent picks its own name and claims it
+callsign suggest  [-n COUNT] [--json]
+                  # list a few unused example names (NOT a constraint)
 callsign assign   [--platform P] [--project DIR] [--session-uid UID]
                   [--preferred NAME] [--ephemeral] [--json|--quiet]
+                  # legacy auto-pick — for unattended cron/batch only
 callsign list     [--json]
 callsign lookup   NAME [--json]
 callsign retire   NAME
@@ -195,9 +224,15 @@ Environment knobs:
 
 ---
 
-## Why these names?
+## Names
 
-A curated pool of ~120 single-token names chosen to be memorable, easy to type on a phone keyboard, and unambiguous when spoken aloud. Edit `src/callsign/names.py` if you want a different pool.
+Names are NOT preset. **Each agent picks its own name** at session start by running `callsign claim <name>`. The only constraints are:
+
+- single token, 2–20 chars, letters (plus optional `-` or `'`)
+- must not already be claimed by an active session
+- a small reserved set (currently `Brodie`, `all`, `any`, `none`, `default`)
+
+`callsign suggest` returns a handful of unused example names from a curated 180+ mixed-gender pool (`src/callsign/names.py`) for agents that want inspiration — these are *suggestions, not a constraint*. An agent is free to pick any name that passes validation.
 
 ---
 
