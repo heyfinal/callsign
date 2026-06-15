@@ -1,6 +1,6 @@
 {
   "name": "callsign",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Unique per-session agent names + iMessage routing for Claude Code and Hermes.",
   "author": "heyfinal",
   "homepage": "https://github.com/heyfinal/callsign",
