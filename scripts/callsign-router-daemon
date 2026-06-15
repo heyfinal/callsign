@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# callsign-router-daemon — long-running router. Subscribes to `imsg watch`
+# and writes routing decisions (callsign → session) to ~/.callsign/logs/.
+#
+# Suitable target for launchd KeepAlive. Restarts the inner pipeline on EOF.
+
+set -euo pipefail
+
+LOG_DIR="${HOME}/.callsign/logs"
+mkdir -p "${LOG_DIR}"
+
+while true; do
+    imsg watch --json 2>>"${LOG_DIR}/router.stderr" \
+        | callsign router \
+        >>"${LOG_DIR}/router.stdout" 2>>"${LOG_DIR}/router.stderr" || true
+    sleep 2
+done

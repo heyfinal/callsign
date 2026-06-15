@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# imsg-callsign — drop-in replacement for `imsg send` that auto-prefixes the
+# outbound text with the current session's callsign.
+#
+# Usage:
+#   imsg-callsign "on it, sir."
+#   imsg-callsign --to +14053151310 "patched and pushed."
+#   imsg-callsign --no-prefix "raw passthrough"
+#
+# Honors $CALLSIGN from the SessionStart hook. Falls back to plain imsg send
+# when CALLSIGN is unset.
+
+set -euo pipefail
+
+NO_PREFIX=0
+TO=""
+SERVICE=""
+ARGS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --no-prefix) NO_PREFIX=1; shift;;
+        --to) TO="$2"; shift 2;;
+        --service) SERVICE="$2"; shift 2;;
+        --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done;;
+        -*)
+            echo "imsg-callsign: unknown flag $1" >&2; exit 2;;
+        *) ARGS+=("$1"); shift;;
+    esac
+done
+
+if [ "${#ARGS[@]}" -eq 0 ]; then
+    echo "usage: imsg-callsign [--to PHONE] [--service S] [--no-prefix] TEXT..." >&2
+    exit 2
+fi
+
+TEXT="${ARGS[*]}"
+if [ "$NO_PREFIX" -eq 0 ] && [ -n "${CALLSIGN:-}" ]; then
+    TEXT="${CALLSIGN}: ${TEXT}"
+fi
+
+TO="${TO:-${CALLSIGN_DEFAULT_TO:-+14053151310}}"
+
+CMD=(imsg send --to "$TO" --text "$TEXT")
+if [ -n "$SERVICE" ]; then
+    CMD+=(--service "$SERVICE")
+fi
+
+exec "${CMD[@]}"
