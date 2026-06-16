@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "callsign"
-version = "0.3.0"
+version = "0.3.1"
 description = "Bidirectional iMessage middle-man + unique per-session names for Claude Code and Hermes."
 readme = "README.md"
 license = { text = "MIT" }

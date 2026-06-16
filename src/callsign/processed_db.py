@@ -112,6 +112,22 @@ def mark_dispatched(guid: str) -> None:
         )
 
 
+def try_claim_dispatch(guid: str) -> bool:
+    """Atomic compare-and-set: mark dispatched_at=NOW only if it's currently NULL.
+
+    Closes the day-1 TOCTOU race where two workers both pass an is_replied()
+    check and both fire `claude --resume`. The single statement is atomic
+    against other writers via SQLite WAL.
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE processed SET dispatched_at=? "
+            "WHERE guid=? AND dispatched_at IS NULL AND reply_sent_at IS NULL",
+            (time.time(), guid),
+        )
+        return cur.rowcount > 0
+
+
 def mark_chunks(guid: str, chunks_sent: int, chunks_total: int) -> None:
     with _conn() as c:
         c.execute(

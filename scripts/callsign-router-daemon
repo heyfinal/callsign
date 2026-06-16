@@ -18,13 +18,11 @@ PID_FILE="${ROOT}/router.pid"
 mkdir -p "${LOG_DIR}"
 chmod 700 "${ROOT}" 2>/dev/null || true
 
-echo $$ > "${PID_FILE}"
-
 cleanup() {
     rm -f "${PID_FILE}"
     exit 0
 }
-trap cleanup TERM INT HUP
+trap cleanup TERM INT HUP EXIT
 
 BACKOFF=2
 BACKOFF_MAX=300
@@ -48,6 +46,10 @@ if [ ! -x "${IMSG_BIN}" ] || [ ! -x "${CALLSIGN_BIN}" ]; then
     sleep 60
     exit 1
 fi
+
+# Write PID file ONLY after preflight passes — otherwise a missing-binary
+# exit leaves a stale pidfile that fools `callsign status`.
+echo $$ > "${PID_FILE}"
 
 while true; do
     started=$(date +%s)

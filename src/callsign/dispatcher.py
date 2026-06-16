@@ -69,14 +69,24 @@ def _run_claude(session_uid: str, body: str, timeout: int) -> tuple[int, str, st
         out, err = proc.communicate(input=body.encode("utf-8"), timeout=timeout)
         return proc.returncode, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace")
     except subprocess.TimeoutExpired:
+        # Kill the whole process group so grandchildren don't survive.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        out, err = b"", b""
         try:
             out, err = proc.communicate(timeout=2)
         except subprocess.TimeoutExpired:
-            out, err = b"", b""
+            # SIGKILL second time on the leader; reap to avoid zombie.
+            try:
+                proc.kill()
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass  # at this point launchd / OS reaping owns the cleanup
         return 124, out.decode("utf-8", errors="replace"), err.decode("utf-8", errors="replace") + "\n(killed by dispatcher timeout)"
 
 
@@ -136,21 +146,32 @@ def fire(session: Session, msg: InboundMessage, *, dry_run: bool = False,
     })
     fresh = processed_db.enqueue(msg.guid, msg.callsign, msg.sender, msg.chat_id, msg.body)
 
-    # Step 2 — short lock for state transitions only
+    # Step 2 — atomic dispatch claim under per-session lock. The
+    # try_claim_dispatch UPDATE is the day-1 race fix: GPT-5.4 + DeepSeek both
+    # flagged that checking is_replied() outside the dispatch claim leaves a
+    # TOCTOU window where two workers both pass the gate and both fire
+    # `claude --resume`. The single UPDATE with WHERE dispatched_at IS NULL
+    # makes the dispatch claim atomic against any other writer (WAL keeps
+    # readers consistent).
     try:
         with locks.acquire(session.session_uid or msg.callsign, timeout=cfg.lock_wait_short):
             if processed_db.is_replied(msg.guid):
                 return {"ok": True, "skipped": "already_replied"}
-            existing = processed_db.get(msg.guid)
-            if existing and existing.dispatched_at and not existing.reply_sent_at:
-                # claude already ran but reply delivery never finished.
-                # Do NOT re-run claude (it mutated session state). Operator escalation.
-                alerts.alert(
-                    "callsign: stuck delivery",
-                    f"guid={msg.guid[:12]} callsign={msg.callsign} sender={msg.sender}",
-                    kind="stuck_delivery",
-                )
-                return {"ok": False, "stuck": "dispatched_but_not_replied"}
+            if dry_run:
+                claimed = True  # bypass for smoke tests
+            else:
+                claimed = processed_db.try_claim_dispatch(msg.guid)
+            if not claimed and not dry_run:
+                # Someone else owns this dispatch; check if they finished it.
+                existing = processed_db.get(msg.guid)
+                if existing and existing.dispatched_at and not existing.reply_sent_at:
+                    alerts.alert(
+                        "callsign: stuck delivery",
+                        f"guid={msg.guid[:12]} callsign={msg.callsign} sender={msg.sender}",
+                        kind="stuck_delivery",
+                    )
+                    return {"ok": False, "stuck": "dispatched_but_not_replied"}
+                return {"ok": True, "skipped": "claimed_by_other_worker"}
     except locks.LockTimeout:
         alerts.alert(
             "callsign: lock timeout",
@@ -160,12 +181,13 @@ def fire(session: Session, msg: InboundMessage, *, dry_run: bool = False,
         return {"ok": False, "error": "lock_timeout"}
 
     if dry_run:
-        # Synthetic reply path for smoke tests / quiet hours
         reply = f"(dry-run reply for guid={msg.guid[:8]})"
         rc = 0
         stderr = ""
     else:
-        # Step 3 — claude OUTSIDE the lock
+        # Step 3 — claude OUTSIDE the lock. dispatched_at was already set by
+        # the atomic claim above, so a crashing worker will be detected as
+        # "stuck" rather than re-fired.
         if not session.session_uid:
             alerts.alert(
                 "callsign: no session UID",
@@ -177,7 +199,6 @@ def fire(session: Session, msg: InboundMessage, *, dry_run: bool = False,
             return {"ok": False, "error": "no_session_uid"}
 
         rc, reply, stderr = _run_claude(session.session_uid, msg.body, timeout=cfg.dispatch_timeout)
-        processed_db.mark_dispatched(msg.guid)
 
         if rc != 0:
             err = f"claude rc={rc} stderr={stderr[:500]}"
@@ -203,9 +224,11 @@ def fire(session: Session, msg: InboundMessage, *, dry_run: bool = False,
         return {"ok": False, "error": "no_recipient"}
 
     cs_prefix = f"{msg.callsign}: "
+    # Marker worst case is `[NN/NN:abcdef12] ` ~ 17 bytes; reserve 24 for
+    # safety. (The original 8-byte reserve was too tight — caught by review.)
     chunks = chunking.chunked(
         reply,
-        max_bytes=cfg.chunk_size_bytes - len(cs_prefix.encode("utf-8")) - 8,
+        max_bytes=cfg.chunk_size_bytes - len(cs_prefix.encode("utf-8")) - 24,
         with_markers=True,
         id_token=msg.guid[:8],
     ) or [reply or "(empty reply)"]

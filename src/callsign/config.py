@@ -26,9 +26,17 @@ else:
 @dataclass(frozen=True)
 class QuietHours:
     start_hour: int = 23
+    start_minute: int = 0
     end_hour: int = 6
+    end_minute: int = 0
     tz: str = "America/Chicago"
     behavior: str = "queue"  # queue | drop | dispatch_anyway
+
+    def start_minutes(self) -> int:
+        return self.start_hour * 60 + self.start_minute
+
+    def end_minutes(self) -> int:
+        return self.end_hour * 60 + self.end_minute
 
 
 @dataclass(frozen=True)
@@ -57,20 +65,32 @@ class Config:
                 data = {}
 
         qh_raw = data.get("quiet_hours") or {}
-        # Tolerate "HH:MM" strings as well as ints.
-        def _parse_hour(val: Any, default: int) -> int:
-            if isinstance(val, int):
-                return max(0, min(23, val))
-            if isinstance(val, str) and ":" in val:
-                try:
-                    return max(0, min(23, int(val.split(":", 1)[0])))
-                except ValueError:
-                    pass
-            return default
 
+        def _parse_hm(val: Any, default_h: int, default_m: int) -> tuple[int, int]:
+            """Tolerate int hours or 'HH:MM' strings. Preserves minutes."""
+            if isinstance(val, int):
+                return max(0, min(23, val)), 0
+            if isinstance(val, str):
+                if ":" in val:
+                    try:
+                        h_str, m_str = val.split(":", 1)
+                        return (
+                            max(0, min(23, int(h_str))),
+                            max(0, min(59, int(m_str))),
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                try:
+                    return max(0, min(23, int(val))), 0
+                except (ValueError, TypeError):
+                    pass
+            return default_h, default_m
+
+        sh, sm = _parse_hm(qh_raw.get("start"), 23, 0)
+        eh, em = _parse_hm(qh_raw.get("end"), 6, 0)
         qh = QuietHours(
-            start_hour=_parse_hour(qh_raw.get("start"), 23),
-            end_hour=_parse_hour(qh_raw.get("end"), 6),
+            start_hour=sh, start_minute=sm,
+            end_hour=eh, end_minute=em,
             tz=str(qh_raw.get("tz") or "America/Chicago"),
             behavior=str(qh_raw.get("behavior") or "queue"),
         )
@@ -94,21 +114,27 @@ class Config:
 
 
 def in_quiet_hours(cfg: Config | None = None, now=None) -> bool:
-    """True if wall-clock time is inside the configured quiet window."""
+    """True if wall-clock time is inside the configured quiet window.
+
+    Resolves the configured tz via zoneinfo. If zoneinfo / the tz name is
+    unavailable, falls back to the SYSTEM-default tz — explicit so a
+    misconfigured tz doesn't silently use UTC.
+    """
     cfg = cfg or Config.load()
     from datetime import datetime
+    tz = None
     try:
         from zoneinfo import ZoneInfo
         tz = ZoneInfo(cfg.quiet_hours.tz)
     except Exception:
         tz = None
-    n = now or (datetime.now(tz) if tz else datetime.now())
-    s = cfg.quiet_hours.start_hour
-    e = cfg.quiet_hours.end_hour
-    h = n.hour
+    n = now or (datetime.now(tz) if tz else datetime.now().astimezone())
+    s = cfg.quiet_hours.start_minutes()
+    e = cfg.quiet_hours.end_minutes()
+    cur = n.hour * 60 + n.minute
     if s == e:
         return False
     if s < e:
-        return s <= h < e
-    # Window crosses midnight (typical: 23 → 06).
-    return h >= s or h < e
+        return s <= cur < e
+    # Window crosses midnight (typical: 23:00 → 06:00).
+    return cur >= s or cur < e
