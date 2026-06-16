@@ -1,0 +1,35 @@
+{
+  "name": "callsign",
+  "version": "0.2.1",
+  "description": "Unique per-session agent names + iMessage routing for Claude Code and Hermes. Every session picks its own callsign at start; daniel addresses each one by name.",
+  "author": {
+    "name": "heyfinal",
+    "url": "https://github.com/heyfinal"
+  },
+  "homepage": "https://github.com/heyfinal/callsign",
+  "repository": "https://github.com/heyfinal/callsign",
+  "license": "MIT",
+  "keywords": [
+    "session",
+    "naming",
+    "imessage",
+    "routing",
+    "multi-agent",
+    "callsign",
+    "hermes",
+    "macos"
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${PLUGIN_DIR}/src/callsign/hooks/session_start.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

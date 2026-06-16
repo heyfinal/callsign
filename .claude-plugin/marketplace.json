@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "callsign",
+  "description": "Self-marketplace for the callsign plugin — unique per-session agent names + iMessage routing for Claude Code and Hermes.",
+  "owner": {
+    "name": "heyfinal",
+    "url": "https://github.com/heyfinal"
+  },
+  "plugins": [
+    {
+      "name": "callsign",
+      "description": "Unique per-session agent names + iMessage routing for Claude Code and Hermes. Every session picks its own callsign at start.",
+      "author": {
+        "name": "heyfinal"
+      },
+      "category": "productivity",
+      "source": "./",
+      "homepage": "https://github.com/heyfinal/callsign"
+    }
+  ]
+}
