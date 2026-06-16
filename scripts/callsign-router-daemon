@@ -1,17 +1,70 @@
 #!/usr/bin/env bash
-# callsign-router-daemon — long-running router. Subscribes to `imsg watch`
-# and writes routing decisions (callsign → session) to ~/.callsign/logs/.
+# callsign-router-daemon — long-running router + dispatcher.
 #
-# Suitable target for launchd KeepAlive. Restarts the inner pipeline on EOF.
+# Subscribes to `imsg watch --json`, pipes to `callsign router --dispatch`.
+# Exponential backoff between restart attempts (caps at 5 minutes). Resets
+# the backoff window after 30s of stable run.
+#
+# Writes PID to ~/.callsign/router.pid so `callsign status` can detect it.
+#
+# Suitable target for launchd KeepAlive. Reads STDIN noop; sends graceful
+# shutdown on SIGTERM (launchctl unload).
 
-set -euo pipefail
+set -uo pipefail
 
-LOG_DIR="${HOME}/.callsign/logs"
+ROOT="${HOME}/.callsign"
+LOG_DIR="${ROOT}/logs"
+PID_FILE="${ROOT}/router.pid"
 mkdir -p "${LOG_DIR}"
+chmod 700 "${ROOT}" 2>/dev/null || true
+
+echo $$ > "${PID_FILE}"
+
+cleanup() {
+    rm -f "${PID_FILE}"
+    exit 0
+}
+trap cleanup TERM INT HUP
+
+BACKOFF=2
+BACKOFF_MAX=300
+RESET_AFTER=30  # seconds of stable run that reset backoff to 2s
+
+# Resolve binaries (PATH inside launchd is minimal — be explicit).
+CALLSIGN_BIN="$(command -v callsign || true)"
+IMSG_BIN="$(command -v imsg || true)"
+if [ -z "${CALLSIGN_BIN}" ]; then
+    CALLSIGN_BIN="${HOME}/.local/bin/callsign"
+fi
+if [ -z "${IMSG_BIN}" ]; then
+    for c in /opt/homebrew/bin/imsg /usr/local/bin/imsg "${HOME}/.local/bin/imsg"; do
+        [ -x "$c" ] && IMSG_BIN="$c" && break
+    done
+fi
+
+if [ ! -x "${IMSG_BIN}" ] || [ ! -x "${CALLSIGN_BIN}" ]; then
+    echo "$(date -Iseconds) FATAL: missing CLIs (imsg=${IMSG_BIN}, callsign=${CALLSIGN_BIN})" \
+        >>"${LOG_DIR}/router.stderr"
+    sleep 60
+    exit 1
+fi
 
 while true; do
-    imsg watch --json 2>>"${LOG_DIR}/router.stderr" \
-        | callsign router \
-        >>"${LOG_DIR}/router.stdout" 2>>"${LOG_DIR}/router.stderr" || true
-    sleep 2
+    started=$(date +%s)
+    "${IMSG_BIN}" watch --json 2>>"${LOG_DIR}/router.stderr" \
+        | "${CALLSIGN_BIN}" router --dispatch \
+            >>"${LOG_DIR}/router.stdout" 2>>"${LOG_DIR}/router.stderr" \
+        || true
+    ended=$(date +%s)
+    run_time=$(( ended - started ))
+
+    if [ "${run_time}" -ge "${RESET_AFTER}" ]; then
+        BACKOFF=2
+    else
+        BACKOFF=$(( BACKOFF * 2 ))
+        [ "${BACKOFF}" -gt "${BACKOFF_MAX}" ] && BACKOFF="${BACKOFF_MAX}"
+    fi
+    echo "$(date -Iseconds) restart after ${run_time}s, backoff=${BACKOFF}s" \
+        >>"${LOG_DIR}/router.stderr"
+    sleep "${BACKOFF}"
 done

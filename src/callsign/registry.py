@@ -81,6 +81,12 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.executescript(SCHEMA)
+    # v0.3 migration — additive only. ALTER TABLE ADD COLUMN is no-op via except
+    # when column already exists.
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN claimed_via TEXT DEFAULT 'manual'")
+    except sqlite3.OperationalError:
+        pass  # column already present
     return conn
 
 

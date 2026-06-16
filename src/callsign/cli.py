@@ -58,6 +58,9 @@ def _resolve_callsign(explicit: str | None = None) -> str | None:
 
 def cmd_claim(ns: argparse.Namespace) -> int:
     ensure_dirs()
+    if not ns.name:
+        print("claim: pass a name or use --auto", file=sys.stderr)
+        return 2
     try:
         sess = registry.claim(
             name=ns.name,
@@ -284,13 +287,22 @@ def cmd_init(ns: argparse.Namespace) -> int:
 
 
 def cmd_router(ns: argparse.Namespace) -> int:
-    """Foreground loop: read incoming imsg stream and log routing decisions.
+    """Foreground loop: read incoming imsg stream, route, optionally dispatch.
 
-    Reads JSON lines from stdin (intended target: `imsg watch --json | callsign router`).
+    Reads JSON lines from stdin (intended target:
+        ``imsg watch --json | callsign router --dispatch``).
     Writes one decision per line to ~/.callsign/logs/router.log and to stdout.
+
+    With ``--dispatch`` and the routed callsign is active, also fires the
+    dispatcher: resumes the matched Claude Code session via
+    ``claude --resume <UID> --print``, captures the reply, and pipes it back
+    out as iMessage chunks. Quiet-hours messages are inboxed without dispatch.
     """
     from callsign.paths import LOG_DIR
+    from callsign import config as cfg_mod, dispatcher as disp_mod, inbox
+
     ensure_dirs()
+    cfg = cfg_mod.Config.load()
     log_path = LOG_DIR / "router.log"
     with log_path.open("a") as log:
         for line in sys.stdin:
@@ -301,22 +313,220 @@ def cmd_router(ns: argparse.Namespace) -> int:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue
+
             text = msg.get("text") or msg.get("body") or ""
             sender = msg.get("sender") or msg.get("from") or ""
+            chat_id = msg.get("chat_id") or msg.get("chat") or ""
+            guid = (msg.get("guid") or msg.get("id")
+                    or f"{sender}:{time.time():.6f}:{hash(text) & 0xffffffff:08x}")
+
             hit = router.route(text)
             decision = {
                 "ts": time.time(),
                 "sender": sender,
+                "chat_id": chat_id,
+                "guid": guid,
                 "text": text,
                 "callsign": hit.callsign if hit else None,
                 "project": hit.session.project_path if hit else None,
                 "pid": hit.session.pid if hit else None,
             }
+
+            if hit and ns.dispatch:
+                inb = disp_mod.InboundMessage(
+                    guid=guid, callsign=hit.callsign,
+                    sender=sender or None, chat_id=chat_id or None,
+                    body=hit.body,
+                )
+                if cfg_mod.in_quiet_hours(cfg):
+                    inbox.append(hit.callsign, {
+                        "guid": guid, "sender": sender, "chat_id": chat_id,
+                        "body": hit.body, "queued_for_quiet": True,
+                    })
+                    decision["queued_quiet_hours"] = True
+                else:
+                    try:
+                        result = disp_mod.fire(hit.session, inb, cfg=cfg)
+                        decision["dispatch"] = result
+                    except Exception as e:
+                        decision["dispatch_error"] = str(e)[:400]
+
             line_out = json.dumps(decision)
-            print(line_out)
+            print(line_out, flush=True)
             log.write(line_out + "\n")
             log.flush()
     return 0
+
+
+def cmd_status(ns: argparse.Namespace) -> int:
+    """Health snapshot of the daemon + queues + processed counts."""
+    from callsign import processed_db
+    from callsign.paths import LOG_DIR, INBOX_DIR
+
+    rows = registry.list_active()
+    stats = processed_db.stats()
+    inbox_files = list(INBOX_DIR.glob("*.jsonl")) if INBOX_DIR.exists() else []
+    inbox_pending = 0
+    for p in inbox_files:
+        try:
+            inbox_pending += sum(1 for _ in p.open("r", encoding="utf-8"))
+        except OSError:
+            continue
+
+    daemon_pid = _read_daemon_pid()
+    daemon_alive = _pid_alive(daemon_pid) if daemon_pid else False
+
+    payload = {
+        "daemon": {
+            "pid": daemon_pid,
+            "alive": daemon_alive,
+        },
+        "registry": {
+            "active": len(rows),
+            "callsigns": [s.callsign for s in rows],
+        },
+        "processed": stats,
+        "inbox": {
+            "files": len(inbox_files),
+            "lines_total": inbox_pending,
+        },
+    }
+    if ns.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        d = payload["daemon"]
+        print(f"daemon:    {'up' if d['alive'] else 'down'} (pid {d['pid'] or '-'})")
+        print(f"registry:  {payload['registry']['active']} active  "
+              f"[{', '.join(payload['registry']['callsigns']) or '-'}]")
+        ps = payload["processed"]
+        print(f"processed: total={ps['total']}  replied={ps['replied']}  "
+              f"errored={ps['errored']}  pending={ps['pending']}")
+        print(f"inbox:     {payload['inbox']['files']} files, "
+              f"{payload['inbox']['lines_total']} lines")
+    return 0 if daemon_alive else 1
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return pid > 0  # PermissionError = exists, we just can't signal
+
+
+def _read_daemon_pid() -> int | None:
+    from callsign.paths import ROOT
+    path = ROOT / "router.pid"
+    if not path.exists():
+        return None
+    try:
+        return int(path.read_text().strip())
+    except (ValueError, OSError):
+        return None
+
+
+def cmd_smoke_test(ns: argparse.Namespace) -> int:
+    """Inject a synthetic inbound message through the full pipeline.
+
+    Validates: router parses leading name, dispatcher finds the session,
+    chunking + send path executes (dry-run: prints to stderr instead of sending).
+    Requires a live callsign claim for the target name.
+    """
+    from callsign import dispatcher as disp_mod, config as cfg_mod
+
+    target = ns.target or _resolve_callsign(None)
+    if not target:
+        print("smoke-test: no target callsign — pass --target NAME or claim one first",
+              file=sys.stderr)
+        return 2
+    sess = registry.lookup(target)
+    if not sess:
+        print(f"smoke-test: no active session for {target}", file=sys.stderr)
+        return 3
+    cfg = cfg_mod.Config.load()
+    msg = disp_mod.InboundMessage(
+        guid=f"smoke-{int(time.time())}",
+        callsign=sess.callsign,
+        sender=ns.sender or "+15555550100",
+        chat_id=None,
+        body=ns.body or "ping",
+    )
+    result = disp_mod.fire(sess, msg, dry_run=True, cfg=cfg)
+    print(json.dumps(result, indent=2))
+    return 0 if result.get("ok") else 1
+
+
+def cmd_drain(ns: argparse.Namespace) -> int:
+    """Drain quiet-hours inbox: re-dispatch queued messages now.
+
+    Intended target: the morning-drain launchd plist (StartCalendarInterval
+    + WakeFromSleep). Idempotent — already-replied guids are skipped by
+    processed_db.is_replied().
+    """
+    from callsign import inbox, dispatcher as disp_mod, config as cfg_mod, processed_db
+
+    cfg = cfg_mod.Config.load()
+    active = {s.callsign: s for s in registry.list_active()}
+    drained = 0
+    skipped = 0
+    failed = 0
+    for cs, sess in active.items():
+        for raw in inbox.read_all(cs):
+            guid = raw.get("guid") or ""
+            if not guid:
+                continue
+            if processed_db.is_replied(guid):
+                skipped += 1
+                continue
+            if not raw.get("queued_for_quiet"):
+                continue
+            inb = disp_mod.InboundMessage(
+                guid=guid, callsign=cs,
+                sender=raw.get("sender") or None,
+                chat_id=raw.get("chat_id") or None,
+                body=raw.get("body") or "",
+            )
+            try:
+                r = disp_mod.fire(sess, inb, cfg=cfg)
+                if r.get("ok"):
+                    drained += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+    out = {"drained": drained, "skipped": skipped, "failed": failed}
+    print(json.dumps(out, indent=2))
+    return 0 if failed == 0 else 1
+
+
+def cmd_claim_auto_or_named(ns: argparse.Namespace) -> int:
+    """Route `callsign claim --auto` to the legacy assign() path."""
+    if getattr(ns, "auto", False):
+        # Map to assign with no preferred, reuse_project False.
+        ensure_dirs()
+        sess = registry.assign(
+            platform=ns.platform,
+            project_path=ns.project or os.getcwd(),
+            pid=ns.pid or os.getppid(),
+            session_uid=ns.session_uid or _detect_session_uid(),
+            preferred=None,
+            env={"argv0": sys.argv[0], "auto": True},
+            reuse_project=False,
+        )
+        uid = sess.session_uid or f"pid-{sess.pid}"
+        _session_env_path(uid).write_text(
+            f"CALLSIGN={sess.callsign}\nCALLSIGN_PLATFORM={sess.platform}\n"
+            f"CALLSIGN_PROJECT={sess.project_path or ''}\nCALLSIGN_PID={sess.pid or ''}\n"
+        )
+        if ns.json:
+            print(json.dumps({"ok": True, "callsign": sess.callsign,
+                              "claimed_via": "auto"}))
+        else:
+            print(sess.callsign)
+        return 0
+    return cmd_claim(ns)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -327,8 +537,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"callsign {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    a = sub.add_parser("claim", help="claim a SPECIFIC name for this session (agent-driven)")
-    a.add_argument("name", help="the name you (the agent) are picking for yourself")
+    a = sub.add_parser("claim", help="claim a name for this session (agent-driven, or --auto)")
+    a.add_argument("name", nargs="?", default=None,
+                   help="the name you (the agent) are picking — omit when using --auto")
+    a.add_argument("--auto", action="store_true",
+                   help="auto-pick from the pool (used by SessionStart hook)")
     a.add_argument("--platform", default="claude-code")
     a.add_argument("--project", default=None)
     a.add_argument("--pid", type=int, default=None)
@@ -336,7 +549,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.add_argument("--quiet", action="store_true",
                    help="only print the callsign on stdout")
-    a.set_defaults(func=cmd_claim)
+    a.set_defaults(func=cmd_claim_auto_or_named)
 
     a = sub.add_parser("suggest",
                        help="list a few unused example names (agents may pick any name)")
@@ -399,8 +612,23 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("init", help="create state directories")
     a.set_defaults(func=cmd_init)
 
-    a = sub.add_parser("router", help="read imsg stream from stdin, log routing")
+    a = sub.add_parser("router", help="read imsg stream from stdin; log + optionally dispatch")
+    a.add_argument("--dispatch", action="store_true",
+                   help="run matched messages through claude --resume and reply via imsg")
     a.set_defaults(func=cmd_router)
+
+    a = sub.add_parser("status", help="health snapshot (daemon, registry, processed counts)")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_status)
+
+    a = sub.add_parser("smoke-test", help="inject a synthetic inbound message (dry-run)")
+    a.add_argument("--target", default=None, help="callsign to deliver to (default: current)")
+    a.add_argument("--sender", default=None, help="fake sender phone/handle")
+    a.add_argument("--body", default=None, help="message body (default: 'ping')")
+    a.set_defaults(func=cmd_smoke_test)
+
+    a = sub.add_parser("drain", help="drain quiet-hours inbox (morning-drain job)")
+    a.set_defaults(func=cmd_drain)
     return p
 
 
