@@ -15,6 +15,23 @@ from callsign.paths import SESSIONS_DIR, ensure_dirs
 from callsign.version import __version__
 
 
+def _norm_sender(s: str) -> str:
+    """Canonicalize an iMessage sender for allowlist comparison.
+
+    Phones -> last 10 digits (ignores +1 / formatting); email handles ->
+    lowercase-exact.
+    """
+    s = (s or "").strip().lower()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits[-10:] if len(digits) >= 10 else s
+
+
+def _allowed_senders() -> set[str]:
+    """Normalized allowlist from $CALLSIGN_ALLOWED_SENDERS, default owner number."""
+    raw = os.environ.get("CALLSIGN_ALLOWED_SENDERS") or "+14053151310"
+    return {_norm_sender(x) for x in raw.split(",") if x.strip()}
+
+
 def _session_env_path(session_uid: str) -> Path:
     return SESSIONS_DIR / f"{session_uid}.env"
 
@@ -44,6 +61,12 @@ def _resolve_callsign(explicit: str | None = None) -> str | None:
     if env:
         return env
     uid = _detect_session_uid()
+    # Canonical identity is the project_callsign name daniel sees (RONIN, ...).
+    if uid:
+        from callsign import project_link
+        name = project_link.session_to_name(uid)
+        if name:
+            return name
     if uid:
         sess = registry.lookup_by_session_uid(uid)
         if sess:
@@ -286,6 +309,39 @@ def cmd_init(ns: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resume(ns: argparse.Namespace) -> int:
+    """Resume a live Claude Code session by its displayed callsign.
+
+    Resolves callsign -> session_id (project_callsign store first, then the
+    package registry) and execs `claude --resume <session_id>`.
+    """
+    from callsign import project_link
+
+    link = project_link.name_to_session(ns.name)
+    sid = link["session_id"] if link else None
+    if not sid:
+        sess = registry.lookup(ns.name)
+        sid = sess.session_uid if sess and sess.status == "active" else None
+    if not sid:
+        print(f"no live session named '{ns.name}' — try `callsign list`", file=sys.stderr)
+        return 1
+    if ns.print_id:
+        print(sid)
+        return 0
+    claude = shutil.which("claude")
+    if not claude:
+        for cand in ("/opt/homebrew/bin/claude",
+                     f"{os.path.expanduser('~')}/.local/bin/claude",
+                     "/usr/local/bin/claude"):
+            if os.path.exists(cand):
+                claude = cand
+                break
+        else:
+            claude = "claude"
+    os.execvp(claude, [claude, "--resume", sid])  # replaces this process
+    return 0  # unreachable
+
+
 def cmd_router(ns: argparse.Namespace) -> int:
     """Foreground loop: read incoming imsg stream, route, optionally dispatch.
 
@@ -299,10 +355,23 @@ def cmd_router(ns: argparse.Namespace) -> int:
     out as iMessage chunks. Quiet-hours messages are inboxed without dispatch.
     """
     from callsign.paths import LOG_DIR
-    from callsign import config as cfg_mod, dispatcher as disp_mod, inbox
+    from callsign import config as cfg_mod, dispatcher as disp_mod, inbox, persona
+    from callsign import transports
 
     ensure_dirs()
     cfg = cfg_mod.Config.load()
+
+    # INPUT-ADAPTER SEAM — this daemon reads ONE transport's raw stream from
+    # stdin; $CALLSIGN_TRANSPORT names it (default "imessage" = `imsg watch
+    # --json`). transports.adapt() normalizes the raw payload into a transport-
+    # neutral InboundEnvelope; transports.authz() applies that transport's OWN
+    # trust basis. Adding terminal/dropbox/tablet later = a new adapter+authz in
+    # transports.py with NO change here. SECURITY: each transport carries its own
+    # authz (iMessage = sender allowlist); unwired transports DENY by default, so
+    # a new surface can never silently inherit iMessage trust or open an
+    # unauthenticated RCE channel.
+    transport = os.environ.get("CALLSIGN_TRANSPORT", "imessage")
+
     log_path = LOG_DIR / "router.log"
     with log_path.open("a") as log:
         for line in sys.stdin:
@@ -314,15 +383,89 @@ def cmd_router(ns: argparse.Namespace) -> int:
             except json.JSONDecodeError:
                 continue
 
-            text = msg.get("text") or msg.get("body") or ""
-            sender = msg.get("sender") or msg.get("from") or ""
-            chat_id = msg.get("chat_id") or msg.get("chat") or ""
-            guid = (msg.get("guid") or msg.get("id")
-                    or f"{sender}:{time.time():.6f}:{hash(text) & 0xffffffff:08x}")
+            env = transports.adapt(msg, transport)
+            if env is None:
+                # Unknown transport shape — skip (don't guess, don't dispatch).
+                continue
+
+            # SELF-FILTER (2026-07-01) — NEVER process our own outbound. An
+            # is_from_me message is something WE (or Daniel from this account)
+            # already sent; routing/replying to it is how self-feedback loops
+            # start. This is transport-agnostic and cheap; it also permanently
+            # forecloses the class of loop the removed 👀 ACK caused.
+            if msg.get("is_from_me") or msg.get("isFromMe") or msg.get("from_me"):
+                continue
+            text = env.text
+            sender = env.sender or ""
+            chat_id = env.chat_id or ""
+            guid = env.guid
+
+            # LAYER 1 — Watermark: skip backlog messages from before daemon started.
+            # Prevents boot-storm when `imsg watch --json` replays historical messages.
+            # Messages are filtered by timestamp (chat.db "date" field).
+            from callsign import watermark as wm_mod
+            msg_timestamp = msg.get("date")  # Cocoa format from imsg watch --json
+            if not wm_mod.should_process_message(msg_timestamp):
+                # Backlog message — skip it. Log for observability.
+                decision = {
+                    "ts": time.time(),
+                    "transport": env.transport,
+                    "sender": sender,
+                    "chat_id": chat_id,
+                    "guid": guid,
+                    "text": text,
+                    "skipped_watermark": True,
+                    "msg_timestamp": msg_timestamp,
+                }
+                log_out = json.dumps(decision)
+                print(log_out, flush=True)
+                log.write(log_out + "\n")
+                log.flush()
+                continue
+
+            # ── PERSONA PATH (Alicia / external humans) ─────────────────────
+            # Daniel's PRIME MESSAGING RULE: a conversational-only sender
+            # (CALLSIGN_PERSONA_SENDERS, default Alicia) gets a warm MARLOWE-
+            # persona reply and NOTHING else. She must NEVER reach the
+            # authz/dispatch/session_inject path below — that drops text into a
+            # live tool-enabled agent session (RCE-equivalent) = ZERO system
+            # access for her. Reply is tool-less, gate-free, sent to HER thread
+            # only. Short-circuits before routing so there is no other surface.
+            if ns.dispatch and text.strip() and persona.is_persona_sender(sender) \
+                    and not router.is_machine_alert(text):
+                from callsign import processed_db as _pdb
+                _pdb.enqueue(guid, "MARLOWE", sender or None, chat_id or None, text)
+                pdecision = {
+                    "ts": time.time(), "transport": env.transport,
+                    "sender": sender, "chat_id": chat_id, "guid": guid,
+                    "text": text, "callsign": "MARLOWE",
+                }
+                if _pdb.is_replied(guid):
+                    pdecision["persona"] = {"skipped": "already_replied"}
+                elif not _pdb.try_claim_dispatch(guid):
+                    pdecision["persona"] = {"skipped": "claimed_by_other"}
+                else:
+                    # Deliver to MARLOWE; relay MARLOWE's output (or nothing) to
+                    # her thread. ok==True covers both a sent reply AND MARLOWE
+                    # deliberately staying silent (send nothing) — both are a
+                    # completed handling, so claim the guid. ok==False == a send
+                    # failure worth retrying.
+                    res = persona.handle(sender or chat_id or "", text)
+                    pdecision["persona"] = res
+                    if res.get("ok"):
+                        _pdb.mark_replied(guid)
+                    else:
+                        _pdb.mark_error(guid, "persona relay/send failed")
+                line_out = json.dumps(pdecision)
+                print(line_out, flush=True)
+                log.write(line_out + "\n")
+                log.flush()
+                continue
 
             hit = router.route(text)
             decision = {
                 "ts": time.time(),
+                "transport": env.transport,
                 "sender": sender,
                 "chat_id": chat_id,
                 "guid": guid,
@@ -333,23 +476,108 @@ def cmd_router(ns: argparse.Namespace) -> int:
             }
 
             if hit and ns.dispatch:
+                ok_auth, why = transports.authz(env)
+                if not ok_auth:
+                    decision["blocked_unauthorized_sender"] = True
+                    decision["authz_reason"] = why
+                    line_out = json.dumps(decision)
+                    print(line_out, flush=True)
+                    log.write(line_out + "\n")
+                    log.flush()
+                    continue
+
+            if hit and ns.dispatch:
                 inb = disp_mod.InboundMessage(
                     guid=guid, callsign=hit.callsign,
                     sender=sender or None, chat_id=chat_id or None,
                     body=hit.body,
                 )
-                if cfg_mod.in_quiet_hours(cfg):
+                quiet = cfg_mod.in_quiet_hours(cfg)
+
+                # 👀 READ-RECEIPT (F2) REMOVED 2026-07-01 (Daniel via MARLOWE).
+                # The eyes-emoji ACK caused a self-feedback loop (it re-read its
+                # own outbound 👀 as a new inbound and ack'd again, ~1/sec, which
+                # starved real routing). Per Daniel's direction it is ripped out
+                # entirely — no tapback, no reply-with-👀, no ACK reaction. A
+                # proper NATIVE tapback read-receipt is reassigned to a macOS/
+                # Apple-native specialist. The operator now routes + replies with
+                # NO read-ACK indicator.
+
+                if quiet:
                     inbox.append(hit.callsign, {
                         "guid": guid, "sender": sender, "chat_id": chat_id,
                         "body": hit.body, "queued_for_quiet": True,
                     })
                     decision["queued_quiet_hours"] = True
-                else:
+                elif os.environ.get("CALLSIGN_SESSION_AWARE", "1") == "1":
+                    # SESSION-AWARE delivery (Daniel 2026-06-25). Deliver the
+                    # inbound INTO the agent's own Claude Code session rather than
+                    # a stateless headless one-shot:
+                    #   PATH A — callsign has a LIVE iTerm session: inject the
+                    #     text into that exact session + submit, as if Daniel
+                    #     typed it. The agent continues its conversation with full
+                    #     context.
+                    #   PATH B — no live session: open a NEW iTerm window AS that
+                    #     callsign (claude-as --new --prompt) and deliver the
+                    #     inbound as the opening prompt.
+                    # GATE: both paths load MEMORY.md and run the agent's OWN
+                    # politeness gate on the injected text — this is gate-
+                    # PRESERVING (unlike the headless `-p` responder, which the
+                    # KB notes does NOT enforce the gate). We send nothing back;
+                    # the agent answers in its own session via its own tools.
+                    # Idempotency: claim the guid so the same inbound isn't
+                    # injected twice across daemon restarts / duplicate stream
+                    # lines.
+                    from callsign import session_inject, processed_db as _pdb
+                    _pdb.enqueue(guid, hit.callsign, sender or None,
+                                 chat_id or None, hit.body)
+                    if _pdb.is_replied(guid):
+                        decision["session_aware"] = {"skipped": "already_delivered"}
+                    elif not _pdb.try_claim_dispatch(guid):
+                        decision["session_aware"] = {"skipped": "claimed_by_other"}
+                    else:
+                        try:
+                            # B2(b): pass the originating chat.db guid + verified
+                            # sender so the executor can verify owner identity for
+                            # protected-class actions (the relay no longer strips
+                            # it). The sender already passed the per-transport
+                            # allowlist (authz) above.
+                            res = session_inject.deliver(
+                                hit.callsign, hit.body,
+                                origin_guid=guid,
+                                origin_sender=sender or None,
+                            )
+                            decision["session_aware"] = res
+                            if res.get("ok"):
+                                _pdb.mark_replied(guid)
+                            else:
+                                _pdb.mark_error(guid, f"session_inject path {res.get('path')}: {res.get('detail','')[:300]}")
+                        except Exception as e:
+                            decision["session_aware_error"] = str(e)[:400]
+                            _pdb.mark_error(guid, str(e)[:300])
+                elif os.environ.get("CALLSIGN_RESPONDER_ENABLED") == "1":
+                    # Reply-as-agent: spawn the addressed agent FRESH (no session
+                    # resume — MARLOWE's live terminal is untouched), capture its
+                    # in-voice reply, send back "NAME: ...". One spawn per
+                    # addressed text; gated on the router hit above so the alert
+                    # flood never spawns anything.
+                    #
+                    # OFF BY DEFAULT (opt-in via CALLSIGN_RESPONDER_ENABLED=1).
+                    # SECURITY: the politeness gate is NOT enforced in
+                    # `claude --agent … -p` headless mode (verified 2026-06-23 —
+                    # `claude -p "what is 2+2"` answers "4" with no trigger word).
+                    # So enabling this responder = an always-answer channel that
+                    # effectively bypasses Daniel's inbound gate. That bypass is
+                    # NOT authorized, so the responder stays disabled until Daniel
+                    # explicitly authorizes the gate exemption. Until then the
+                    # operator still ROUTES, but does not auto-reply.
                     try:
-                        result = disp_mod.fire(hit.session, inb, cfg=cfg)
+                        result = disp_mod.fire_reply_as_agent(inb, cfg=cfg)
                         decision["dispatch"] = result
                     except Exception as e:
                         decision["dispatch_error"] = str(e)[:400]
+                else:
+                    decision["responder_disabled"] = "CALLSIGN_RESPONDER_ENABLED!=1 (gate not enforceable in headless -p; awaiting Daniel auth)"
 
             line_out = json.dumps(decision)
             print(line_out, flush=True)
@@ -466,9 +694,24 @@ def cmd_drain(ns: argparse.Namespace) -> int:
     processed_db.is_replied().
     """
     from callsign import inbox, dispatcher as disp_mod, config as cfg_mod, processed_db
+    from callsign import router as router_mod
+    from callsign.paths import INBOX_DIR
 
     cfg = cfg_mod.Config.load()
+    # Legacy registry sessions (old-style claims) ...
     active = {s.callsign: s for s in registry.list_active()}
+    # ... PLUS any callsign with a queued inbox file that resolves to a LIVE
+    # project_callsign session (MARLOWE, SHANDIE, ...). The registry is no
+    # longer the source of truth for live sessions, so without this the new
+    # operator's queued quiet-hours messages would never drain.
+    if INBOX_DIR.exists():
+        for p in INBOX_DIR.glob("*.jsonl"):
+            cs = p.stem
+            if cs in active:
+                continue
+            hit = router_mod.route(f"{cs}, drain")
+            if hit and hit.session.session_uid:
+                active[cs] = hit.session
     drained = 0
     skipped = 0
     failed = 0
@@ -608,6 +851,11 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("names", help="show the name pool")
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_names)
+
+    a = sub.add_parser("resume", help="resume a live session by its callsign (execs claude --resume <uuid>)")
+    a.add_argument("name", help="the callsign you see on screen, e.g. RONIN")
+    a.add_argument("--print-id", action="store_true", help="print the session UUID instead of resuming")
+    a.set_defaults(func=cmd_resume)
 
     a = sub.add_parser("init", help="create state directories")
     a.set_defaults(func=cmd_init)
